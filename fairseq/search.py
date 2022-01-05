@@ -1,7 +1,9 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) 2017-present, Facebook, Inc.
+# All rights reserved.
 #
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
+# This source code is licensed under the license found in the LICENSE file in
+# the root directory of this source tree. An additional grant of patent rights
+# can be found in the PATENTS file in the same directory.
 
 import math
 
@@ -25,7 +27,7 @@ class Search(object):
             self.indices_buf = torch.LongTensor().to(device=t.device)
             self.beams_buf = torch.LongTensor().to(device=t.device)
 
-    def step(self, step, lprobs, scores):
+    def step(self, step, lprobs, scores, beam_size):
         """Take a single search step.
 
         Args:
@@ -66,9 +68,11 @@ class BeamSearch(Search):
             lprobs = lprobs[:, ::beam_size, :].contiguous()
         else:
             # make probs contain cumulative scores for each hypothesis
-            lprobs.add_(scores[:, :, step - 1].unsqueeze(-1))
+            # make probs contain cumulative scores for each hypothesis
+            assert scores is not None
+            lprobs = lprobs + scores[:, :, step - 1].unsqueeze(-1)
 
-        torch.topk(
+        top_prediction = torch.topk(
             lprobs.view(bsz, -1),
             k=min(
                 # Take the best 2 x beam_size predictions. We'll choose the first
@@ -76,11 +80,15 @@ class BeamSearch(Search):
                 beam_size * 2,
                 lprobs.view(bsz, -1).size(1) - 1,  # -1 so we never select pad
             ),
-            out=(self.scores_buf, self.indices_buf),
         )
-        torch.div(self.indices_buf, vocab_size, out=self.beams_buf)
-        self.indices_buf.fmod_(vocab_size)
-        return self.scores_buf, self.indices_buf, self.beams_buf
+        scores_buf = top_prediction[0]
+        indices_buf = top_prediction[1]
+        # Project back into relative indices and beams
+        beams_buf = indices_buf // vocab_size
+        indices_buf = indices_buf.fmod(vocab_size)
+
+        # At this point, beams_buf and indices_buf are single-dim and contain relative indices
+        return scores_buf, indices_buf, beams_buf
 
 
 class LengthConstrainedBeamSearch(Search):
@@ -166,55 +174,9 @@ class DiverseBeamSearch(Search):
 
 class Sampling(Search):
 
-    def __init__(self, tgt_dict, sampling_topk=-1, sampling_topp=-1.0):
+    def __init__(self, tgt_dict, sampling_topk=-1):
         super().__init__(tgt_dict)
         self.sampling_topk = sampling_topk
-        self.sampling_topp = sampling_topp
-
-    def _sample_topp(self, lprobs):
-        """Sample among the smallest set of elements whose cumulative probability mass exceeds p.
-
-        See `"The Curious Case of Neural Text Degeneration"
-        (Holtzman et al., 2019) <https://arxiv.org/abs/1904.09751>`_.
-
-        Args:
-            lprobs: (bsz x input_beam_size x vocab_size)
-                the model's log-probabilities over the vocabulary at the current step
-
-        Return: A tuple of (trimed_probs, truncated_indices) where:
-            trimed_probs: (bsz x input_beam_size x ?)
-                the model's probabilities over the elements selected to sample from. The
-                width of the third dimension is determined by top-P.
-            truncated_indices: (bsz x input_beam_size x ?)
-                the indices of the chosen elements.
-        """
-        probs = lprobs.exp_()
-
-        # sort the last dimension (vocab dimension) in descending order
-        sorted_probs, sorted_indices = probs.sort(descending=True)
-
-        # compute a mask to indicate the words to be included in the top-P set.
-        cumsum_probs = sorted_probs.cumsum(dim=2)
-        mask = cumsum_probs.lt(self.sampling_topp)
-
-        # note that mask was computed by 'lt'. One more word needs to be included
-        # so that the cumulative probability mass can exceed p.
-        cumsum_mask = mask.cumsum(dim=2)
-        last_included = cumsum_mask[:, :, -1:]
-        last_included.clamp_(0, mask.size()[2] - 1)
-        mask = mask.scatter_(2, last_included, 1)
-
-        # truncate unnecessary dims.
-        max_dim = last_included.max()
-        truncated_mask = mask[:, :, :max_dim + 1]
-        truncated_probs = sorted_probs[:, :, :max_dim + 1]
-        truncated_indices = sorted_indices[:, :, :max_dim + 1]
-
-        # trim the words that are not in top-P by setting their probabilities
-        # to 0, so that they would not be sampled later.
-        trim_mask = (~truncated_mask)
-        trimed_probs = truncated_probs.masked_fill_(trim_mask, 0)
-        return trimed_probs, truncated_indices
 
     def step(self, step, lprobs, scores):
         super()._init_buffers(lprobs)
@@ -229,17 +191,12 @@ class Sampling(Search):
         assert self.pad <= 1, 'sampling assumes the first two symbols can be ignored'
         lprobs_nopad = lprobs[:, :, 2:]
 
-        if self.sampling_topp > 0:
-            # only sample from the smallest set of words whose cumulative probability mass exceeds p
-            probs_nopad, top_indices = self._sample_topp(lprobs_nopad)
-        elif self.sampling_topk > 0:
-            # only sample from top-k candidates
-            lprobs_nopad, top_indices = lprobs_nopad.topk(self.sampling_topk)
-            probs_nopad = lprobs_nopad.exp_()
-        else:
-            probs_nopad = lprobs_nopad.exp_()
+        # only sample from top-k candidates
+        if self.sampling_topk > 0:
+            lprobs_nopad, topk_indices = lprobs_nopad.topk(self.sampling_topk)
 
         # sample
+        probs_nopad = lprobs_nopad.exp_()
         if step == 0:
             self.indices_buf = torch.multinomial(
                 probs_nopad.view(bsz, -1),
@@ -268,10 +225,10 @@ class Sampling(Search):
         )
         self.scores_buf = self.scores_buf.log_().view(bsz, -1)
 
-        # remap indices if using top-k or top-P sampling
-        if self.sampling_topk > 0 or self.sampling_topp > 0:
+        # remap indices if using top-k sampling
+        if self.sampling_topk > 0:
             self.indices_buf = torch.gather(
-                top_indices.expand(bsz, beam_size, -1),
+                topk_indices.expand(bsz, beam_size, -1),
                 dim=2,
                 index=self.indices_buf.unsqueeze(-1),
             ).squeeze(2)
